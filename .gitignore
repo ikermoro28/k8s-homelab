@@ -1,0 +1,44 @@
+# ─── Kubernetes / kubeconfig ──────────────────────────────────────────────────
+kubeconfig
+kubeconfig.yaml
+*.kubeconfig
+.kube/
+
+# ─── Helm ────────────────────────────────────────────────────────────────────
+*.tgz
+charts/
+/*/charts/
+
+# ─── Secretos y credenciales ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+service-account*.json
+
+# ─── Certificados TLS generados localmente ───────────────────────────────────
+tls.crt
+tls.key
+ca.crt
+ca.key
+
+# ─── Editores ────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Logs y temporales ───────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+.cache/
