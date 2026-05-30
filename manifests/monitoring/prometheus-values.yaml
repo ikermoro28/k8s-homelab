@@ -1,0 +1,30 @@
+grafana:
+  adminPassword: "homelabgrafana"
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - grafana.homelab.local
+
+  # Dashboard de kubernetes preinstalado
+  defaultDashboardsEnabled: true
+
+prometheus:
+  prometheusSpec:
+    # Retención de métricas: 7 días (suficiente para el homelab)
+    retention: 7d
+    # Scrapear ServiceMonitors de TODOS los namespaces (no solo del propio)
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+alertmanager:
+  enabled: false   # Lo desactivamos para simplificar — no necesitamos alertas ahora
+
+# node-exporter: métricas de CPU, RAM, disco, red de cada nodo
+nodeExporter:
+  enabled: true
+
+# kube-state-metrics: métricas de objetos K8s (pods, deployments, etc.)
+kubeStateMetrics:
+  enabled: true

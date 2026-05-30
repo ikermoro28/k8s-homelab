@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: homelab
+spec:
+  type: ClusterIP          # Solo accesible dentro del clúster (usaremos Ingress para el exterior)
+  selector:
+    app: nginx             # Balancea tráfico a todos los pods con label app=nginx
+  ports:
+    - name: http
+      port: 80             # Puerto del Service (lo que llamas desde dentro del clúster)
+      targetPort: 80       # Puerto del contenedor al que redirige

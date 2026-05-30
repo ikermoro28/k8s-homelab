@@ -1,0 +1,577 @@
+================================================================================
+  K8S HOMELAB — DIARIO DE PROGRESO
+================================================================================
+Proyecto: Clúster Kubernetes local con k3d
+Hardware: MSI i7-11800H, 32GB RAM, RTX 3060 Mobile, Ubuntu 24.04
+Objetivo: Aprender Kubernetes de forma práctica como sysadmin → portfolio DevOps
+
+
+================================================================================
+  FASE 0 — Preparación del entorno
+================================================================================
+
+OBJETIVO
+  Instalar el toolchain completo y crear la estructura de directorios del proyecto.
+
+HERRAMIENTAS INSTALADAS
+  - Docker 29.1.3     → motor de contenedores (ya estaba instalado)
+  - kubectl v1.36.1   → CLI para interactuar con la API de Kubernetes
+  - k3d v5.8.3        → crea clústeres k3s dentro de contenedores Docker
+  - Helm v3.21.0      → gestor de paquetes para Kubernetes (como apt pero para apps en K8s)
+
+ESTRUCTURA DEL PROYECTO CREADA
+  k8s-homelab/
+  ├── manifests/
+  │   ├── namespace.yaml
+  │   ├── nginx/
+  │   ├── mariadb/
+  │   ├── monitoring/
+  │   └── ingress/
+  ├── app/
+  └── README.md
+
+CONCEPTOS ASUMIDOS
+  - Docker como base: k3d ejecuta los nodos del clúster como contenedores Docker,
+    lo que hace el setup ultraligero en un portátil.
+  - kubectl es el único punto de entrada para gestionar el clúster: crea, elimina,
+    inspecciona y modifica cualquier recurso de Kubernetes.
+  - Helm permite instalar aplicaciones complejas (como Prometheus+Grafana) con
+    un solo comando, gestionando dependencias y configuración via values.yaml.
+
+
+================================================================================
+  FASE 1 — Crear el clúster k3d + namespaces
+================================================================================
+
+OBJETIVO
+  Levantar un clúster k3d multi-nodo y crear los namespaces del proyecto.
+
+CLÚSTER CREADO
+  Nombre: homelab
+  Comando:
+    k3d cluster create homelab \
+      --servers 1 \
+      --agents 2 \
+      --port "8080:80@loadbalancer" \
+      --port "8443:443@loadbalancer" \
+      --k3s-arg "--disable=traefik@server:0"
+
+  Nodos resultantes:
+    k3d-homelab-server-0   Ready   control-plane,master
+    k3d-homelab-agent-0    Ready   worker
+    k3d-homelab-agent-1    Ready   worker
+
+  Contenedor extra: k3d-homelab-serverlb (nginx interno que recibe tráfico externo
+  y lo distribuye al clúster — los puertos 8080/8443 del portátil apuntan aquí).
+
+FICHEROS CREADOS
+  - manifests/namespace.yaml  → define los namespaces homelab y monitoring
+
+NAMESPACES CREADOS
+  - homelab     → todos los recursos de la aplicación (nginx, mariadb, ingress)
+  - monitoring  → stack de Prometheus + Grafana (Fase 6)
+
+CONCEPTOS ASUMIDOS
+  Server vs Agent:
+    - server (control plane): aloja la API de K8s, el scheduler y el controller
+      manager. Decide dónde van los pods. No ejecuta carga de trabajo normal.
+      Analogía: el servidor central que gestiona un datacenter.
+    - agent (worker): ejecuta los pods. Es donde corre tu aplicación real.
+      Analogía: los hypervisors que ejecutan las VMs.
+
+  Namespace:
+    Aislamiento lógico dentro del mismo clúster físico. Como una VLAN o VRF:
+    los recursos de distintos namespaces no se ven entre sí por defecto.
+    Permite aplicar políticas, quotas y RBAC por entorno.
+
+  kubeconfig (~/.kube/config):
+    Fichero que contiene la dirección de la API, las credenciales y el contexto
+    activo. k3d lo actualiza automáticamente al crear el clúster.
+    Analogía: el /etc/ssh/ssh_config de Kubernetes.
+
+  Flag --disable=traefik:
+    k3s incluye Traefik como Ingress Controller por defecto. Lo desactivamos
+    para instalarlo manualmente en la Fase 5 y entender cómo funciona.
+
+
+================================================================================
+  FASE 2 — Desplegar Nginx (Deployments y Services)
+================================================================================
+
+OBJETIVO
+  Servir una web estática con 3 réplicas de Nginx que muestre el hostname del
+  pod, demostrando visualmente el balanceo de carga del Service.
+
+FICHEROS CREADOS
+  - manifests/nginx/configmap.yaml   → HTML de la web con placeholder de hostname
+  - manifests/nginx/deployment.yaml  → Deployment con 3 réplicas + initContainer
+  - manifests/nginx/service.yaml     → Service ClusterIP para balanceo interno
+
+ARQUITECTURA DESPLEGADA
+  ConfigMap (nginx-html)
+    └── montado como volumen en el initContainer
+  initContainer (busybox)
+    └── reemplaza HOSTNAME_PLACEHOLDER con $HOSTNAME real del pod → /html/index.html
+  Deployment (nginx, 3 réplicas)
+    └── cada pod sirve su propio HTML con su hostname
+  Service (nginx, ClusterIP 10.43.87.228:80)
+    └── balancea entre los 3 pods usando selector app=nginx
+
+VERIFICACIÓN REALIZADA
+  Desde dentro del clúster (kubectl exec), peticiones al DNS interno del Service:
+    http://nginx.homelab.svc.cluster.local
+  → los 3 pods rotaron correctamente en las respuestas.
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+  [1] El navegador siempre mostraba el mismo pod al refrescar
+      Causa:   kubectl port-forward fija la conexión a un único pod. El navegador
+               además reutiliza la conexión TCP (HTTP keep-alive), así que nunca
+               hay rotación visible desde el navegador via port-forward.
+      Solución: verificar el balanceo desde dentro del clúster con kubectl exec:
+               for i in $(seq 1 9); do kubectl exec -n homelab deploy/nginx -- \
+                 wget -qO- http://nginx.homelab.svc.cluster.local | grep -o 'nginx-[a-z0-9-]*'
+               done
+               El balanceo real se aprecia en Fase 5 con Ingress Controller.
+
+LECCIÓN IMPORTANTE — port-forward no demuestra balanceo
+  kubectl port-forward service/nginx 9090:80 fija la conexión a UN solo pod.
+  Desde el navegador con HTTP keep-alive tampoco se aprecia rotación.
+  El balanceo real se verá en la Fase 5 cuando el Ingress Controller reciba
+  cada petición HTTP como una conexión TCP independiente.
+
+CONCEPTOS ASUMIDOS
+  Pod:
+    La unidad mínima de K8s. Un pod contiene uno o más contenedores que comparten
+    red y almacenamiento. Analogía: un proceso (o grupo de procesos) en un servidor.
+
+  ReplicaSet:
+    Controlador que garantiza que siempre haya N pods corriendo. Si un pod muere,
+    lo recrea automáticamente. Analogía: un watchdog/supervisor de procesos.
+
+  Deployment:
+    Gestiona ReplicaSets. Permite hacer rollouts (actualizar la imagen), rollbacks,
+    y escalar réplicas de forma declarativa. Es lo que defines en YAML.
+    Analogía: la ficha de configuración de una VM en un hypervisor.
+
+  Service (ClusterIP):
+    IP virtual estable que balancea tráfico entre los pods del selector.
+    Los pods tienen IPs efímeras (cambian al recrearse); el Service es la dirección
+    fija. Analogía: un VIP de HAProxy o keepalived.
+
+  Labels y Selectors:
+    Labels: etiquetas clave=valor en cualquier recurso (app: nginx).
+    Selectors: filtro que usan Services y Deployments para encontrar sus pods.
+    Sin el selector correcto, el Service no envía tráfico a ningún pod.
+
+  ConfigMap:
+    Almacena configuración como ficheros o variables de entorno, desacoplada de
+    la imagen del contenedor. Analogía: /etc/nginx/conf.d/ externalizado en la API.
+
+  initContainer:
+    Contenedor que corre y termina ANTES de que arranque el contenedor principal.
+    Útil para preparar datos, esperar dependencias o inicializar configuración.
+    En este caso: inyecta el hostname real en el HTML antes de que nginx arranque.
+
+  emptyDir (volumen):
+    Volumen temporal en memoria compartido entre contenedores del mismo pod.
+    Se destruye cuando el pod muere. Aquí lo usamos para pasar el HTML del
+    initContainer al contenedor de nginx.
+
+  DNS interno de Kubernetes:
+    Cada Service tiene un nombre DNS resolvible desde cualquier pod del clúster:
+    formato: <service>.<namespace>.svc.cluster.local
+    Ejemplo: nginx.homelab.svc.cluster.local → 10.43.87.228
+
+
+================================================================================
+  FASE 3 — Desplegar MariaDB (StatefulSets y persistencia)
+================================================================================
+
+OBJETIVO
+  Desplegar MariaDB como StatefulSet con almacenamiento persistente, demostrar
+  que los datos sobreviven al borrado y recreación del pod.
+
+FICHEROS CREADOS
+  - manifests/mariadb/secret.yaml      → credenciales de MariaDB en base64
+  - manifests/mariadb/pvc.yaml         → reserva de 1Gi de almacenamiento
+  - manifests/mariadb/service.yaml     → headless Service para MariaDB
+  - manifests/mariadb/statefulset.yaml → StatefulSet con 1 réplica
+
+CREDENCIALES CONFIGURADAS
+  root password : rootpassword
+  usuario app   : homelabuser / homelabpass
+  base de datos : homelabdb
+
+ARQUITECTURA DESPLEGADA
+  Secret (mariadb-secret)
+    └── referenciado por el StatefulSet como variables de entorno
+  PVC (mariadb-pvc, 1Gi, ReadWriteOnce)
+    └── k3d lo resuelve con StorageClass "local-path" (directorio en el nodo)
+  Headless Service (mariadb, clusterIP: None)
+    └── DNS estable: mariadb-0.mariadb.homelab.svc.cluster.local
+  StatefulSet (mariadb, 1 réplica)
+    └── pod mariadb-0 montando /var/lib/mysql desde el PVC
+
+VERIFICACIÓN REALIZADA
+  1. Pod mariadb-0 arrancó en Running en ~43s (descarga de imagen mariadb:11.4)
+  2. Creada tabla "visitas" e insertado registro desde kubectl exec
+  3. Pod eliminado manualmente → recreado automáticamente como mariadb-0 en 1s
+  4. Datos consultados tras recreación → registro persistió correctamente
+
+LECCIÓN IMPORTANTE — StatefulSet vs Deployment
+  Al borrar mariadb-0, el StatefulSet lo recreó con EXACTAMENTE el mismo nombre
+  y montó el MISMO PVC. Un Deployment habría creado un pod con nombre aleatorio
+  nuevo y sin garantía de montar el mismo volumen → los datos se habrían perdido.
+
+CONCEPTOS ASUMIDOS
+  StatefulSet:
+    Controlador para cargas de trabajo con estado. Garantiza identidad estable
+    (nombre de pod fijo: mariadb-0, mariadb-1...), volumen asociado permanente
+    y arranque/parada ordenados. Analogía: servidor MySQL con nombre fijo, IP
+    fija y disco dedicado, frente a workers anónimos en un pool.
+
+  PersistentVolume (PV):
+    El disco físico real aprovisionado en el clúster. En k3d usa "local-path":
+    un directorio en el nodo worker. En producción sería un disco de AWS EBS,
+    NFS, Ceph, etc. Analogía: un LUN en una SAN.
+
+  PersistentVolumeClaim (PVC):
+    La "reserva" o petición de almacenamiento que hace un pod. El clúster busca
+    un PV que satisfaga los requisitos (tamaño, modo de acceso) y lo enlaza.
+    Analogía: montar el LUN en el servidor con las características pedidas.
+
+  AccessMode ReadWriteOnce:
+    Solo un nodo puede montar el volumen en modo escritura simultáneamente.
+    Correcto para bases de datos. Otros modos: ReadWriteMany (NFS compartido),
+    ReadOnlyMany (contenido estático compartido en lectura).
+
+  Secret (tipo Opaque):
+    Almacena datos sensibles en base64 (encoding, no cifrado). Los pods los
+    consumen como variables de entorno o ficheros montados. En producción se
+    complementa con Sealed Secrets o Vault para cifrado real.
+    Analogía: fichero en /etc/secrets/ con permisos 600, gestionado por K8s.
+
+  Headless Service (clusterIP: None):
+    No crea IP virtual. El DNS devuelve directamente las IPs de los pods.
+    Permite acceder a pods individuales por nombre estable:
+      mariadb-0.mariadb.homelab.svc.cluster.local
+    Correcto para BD donde no quieres balanceo aleatorio entre réplicas.
+    Un Service normal con ClusterIP balancearía entre pods sin distinción.
+
+  StorageClass local-path (k3d por defecto):
+    Aprovisiona volúmenes como directorios en el nodo worker. Simple y válido
+    para desarrollo local. No es adecuado para producción (no hay replicación
+    ni tolerancia a fallos del nodo).
+
+
+================================================================================
+  FASE 4 — Conectar Nginx con MariaDB (aplicación completa)
+================================================================================
+
+OBJETIVO
+  Demostrar la comunicación entre servicios dentro del clúster usando el DNS
+  interno de Kubernetes. La web debe mostrar datos reales consultados a MariaDB.
+
+FICHEROS CREADOS / MODIFICADOS
+  - manifests/nginx/configmap-php.yaml  → script PHP + config nginx para FastCGI
+  - manifests/nginx/deployment.yaml     → reemplazado: ahora usa 2 contenedores
+                                          por pod (nginx + php-fpm) + initContainer
+
+ARQUITECTURA DESPLEGADA
+  Pod (×3 réplicas):
+    initContainer (busybox)
+      └── copia index.php del ConfigMap al volumen webroot compartido
+    Contenedor nginx
+      └── sirve HTTP, delega .php a php-fpm via FastCGI en localhost:9000
+    Contenedor php-fpm
+      └── ejecuta index.php, se conecta a MariaDB via DNS interno
+          instala extensión mysqli al arrancar (docker-php-ext-install mysqli)
+
+  Flujo de una petición:
+    Navegador → Service nginx → Pod → nginx:80 → php-fpm:9000 →
+    mariadb.homelab.svc.cluster.local:3306 → mariadb-0 → tabla visitas
+
+PATRÓN USADO — Sidecar
+  Dos contenedores en el mismo pod comparten red (se ven en localhost) y
+  volúmenes. Nginx y PHP-FPM se comunican via socket FastCGI internamente.
+  Analogía: Apache + mod_fcgid en el mismo servidor, pero desacoplados como
+  procesos independientes con ciclos de vida separados.
+
+VERIFICACIÓN REALIZADA
+  Web accesible en http://localhost:9090 via port-forward mostrando:
+  - Hostname del pod que responde
+  - Estado "CONECTADO" a mariadb.homelab.svc.cluster.local
+  - Tabla con las visitas consultadas de MariaDB en tiempo real
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+  [1] Fatal error: Uncaught Error: Class "mysqli" not found
+      Causa:   La imagen php:8.3-fpm-alpine no incluye la extensión mysqli.
+               PHP oficial separa el core de las extensiones para mantener
+               imágenes ligeras.
+      Solución: Añadir command al contenedor php-fpm para instalar la extensión
+               antes de arrancar el proceso:
+               command: ["sh", "-c", "docker-php-ext-install mysqli && php-fpm -F"]
+               Penalización: ~20-30s extra en el primer arranque del pod.
+               En producción se usaría una imagen personalizada con la extensión
+               ya compilada para evitar esa latencia.
+
+CONCEPTOS ASUMIDOS
+  DNS interno de Kubernetes:
+    Cada Service es accesible desde cualquier pod del clúster por su nombre DNS:
+      <service>.<namespace>.svc.cluster.local
+    No hacen falta IPs. El CoreDNS del clúster resuelve el nombre al ClusterIP
+    del Service. Analogía: DNS interno corporativo donde "bd-produccion" resuelve
+    a la IP del servidor de base de datos sin conocerla explícitamente.
+
+  Sidecar pattern:
+    Patrón en el que se añade un segundo contenedor al pod para extender la
+    funcionalidad del principal sin modificar su imagen. Aquí: nginx (proxy HTTP)
+    + php-fpm (runtime PHP). Otros usos comunes: log shippers, proxies mTLS,
+    agentes de monitorización.
+
+  Multi-container pod:
+    Los contenedores de un mismo pod comparten:
+    - Red: se ven mutuamente en localhost (no necesitan Service entre ellos)
+    - Volúmenes: pueden montar los mismos volúmenes simultáneamente
+    No comparten: sistema de ficheros raíz, procesos, usuarios.
+
+  Service discovery en K8s:
+    Las aplicaciones no necesitan conocer IPs. Se conectan por nombre de Service.
+    Si el pod de MariaDB muere y se recrea con nueva IP, el Service actualiza
+    automáticamente sus endpoints — la app no nota nada.
+
+
+================================================================================
+  FASE 5 — Ingress con Traefik (acceso externo con dominio local)
+================================================================================
+
+OBJETIVO
+  Instalar Traefik como Ingress Controller y configurar acceso externo a la web
+  con dominio local (homelab.local) en lugar de kubectl port-forward.
+
+FICHEROS CREADOS
+  - manifests/ingress/traefik-values.yaml  → valores Helm para instalar Traefik
+  - manifests/ingress/ingress.yaml         → reglas de enrutamiento por hostname
+
+INSTALACIÓN
+  helm install traefik traefik/traefik \
+    --namespace traefik --create-namespace \
+    --values k8s-homelab/manifests/ingress/traefik-values.yaml
+
+ARQUITECTURA DESPLEGADA
+  k3d serverlb (0.0.0.0:8080→80)
+    └── Traefik pod (namespace traefik, Service LoadBalancer)
+          └── regla host=homelab.local → Service nginx (namespace homelab)
+                └── 3 pods nginx+php-fpm
+
+  /etc/hosts: 127.0.0.1  homelab.local  traefik.homelab.local
+
+VERIFICACIÓN REALIZADA
+  - Web accesible en http://homelab.local:8080 desde el navegador
+  - Balanceo entre los 3 pods confirmado (cada petición HTTP va a un pod diferente)
+  - Dashboard de Traefik accesible en http://traefik.homelab.local:8080
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+  [1] INSTALLATION FAILED: additional properties 'isDefaultIngressClass' not allowed
+      Causa:   El campo isDefaultIngressClass fue eliminado del schema del chart
+               de Traefik en versiones recientes.
+      Solución: Eliminar el campo del values.yaml. El IngressClass se marca como
+               default mediante otros mecanismos o se referencia explícitamente
+               en cada Ingress con spec.ingressClassName.
+
+  [2] Warning: annotation "kubernetes.io/ingress.class" is deprecated
+      Causa:   La anotación kubernetes.io/ingress.class es la forma antigua (pre
+               Kubernetes 1.18) de asociar un Ingress a un controller.
+      Solución: Reemplazar la anotación por el campo spec.ingressClassName en el
+               manifiesto del Ingress. La nueva forma referencia un objeto
+               IngressClass real del clúster y permite validación por parte de K8s.
+
+CONCEPTOS ASUMIDOS
+  Ingress Controller:
+    Pod que actúa como reverse proxy HTTP/S de entrada al clúster. Traefik
+    observa los recursos Ingress de la API y reconfigura sus reglas en tiempo
+    real sin reinicios. Analogía: nginx/HAProxy como frontend centralizado de
+    todos los servicios del clúster.
+
+  Ingress resource:
+    Objeto K8s que define reglas de enrutamiento: qué hostname o path va a qué
+    Service. Solo funciona si hay un Ingress Controller escuchando.
+    Analogía: un virtualhost de Apache o bloque server{} de nginx.
+
+  IngressClass:
+    Objeto que identifica qué controller gestiona un Ingress. Permite tener
+    varios Ingress Controllers en el mismo clúster (Traefik para apps internas,
+    nginx para externas, etc.) y asignar cada Ingress al correcto.
+
+  Service NodePort vs LoadBalancer vs Ingress:
+    - NodePort: expone un puerto en TODOS los nodos. Un puerto por servicio.
+    - LoadBalancer: igual pero crea un LB externo (en cloud). Costoso en dinero.
+    - Ingress: un único punto de entrada (80/443) enruta a N servicios por
+      host/path. Más eficiente y flexible. Estándar en producción.
+
+  Balanceo real con Ingress:
+    A diferencia de port-forward (que fija una conexión a un pod), el Ingress
+    Controller recibe cada petición HTTP como conexión TCP independiente y la
+    enruta a un pod distinto → balanceo real visible desde el navegador.
+
+
+================================================================================
+  FASE 6 — Monitorización con Prometheus + Grafana
+================================================================================
+
+OBJETIVO
+  Instalar kube-prometheus-stack via Helm y acceder a métricas del clúster
+  en tiempo real desde Grafana con dominio local.
+
+FICHEROS CREADOS
+  - manifests/monitoring/prometheus-values.yaml → valores Helm del stack
+
+INSTALACIÓN
+  helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+    --namespace monitoring \
+    --values k8s-homelab/manifests/monitoring/prometheus-values.yaml
+
+PODS DESPLEGADOS (namespace monitoring)
+  kube-prometheus-stack-grafana                    3/3   (grafana + 2 sidecars de config)
+  kube-prometheus-stack-kube-state-metrics         1/1   (métricas de objetos K8s)
+  kube-prometheus-stack-operator                   1/1   (gestiona CRDs de Prometheus)
+  kube-prometheus-stack-prometheus-node-exporter   1/1 × 3 nodos (métricas del SO)
+  prometheus-kube-prometheus-stack-prometheus      2/2   (prometheus + sidecar config)
+
+ACCESO
+  http://grafana.homelab.local:8080  →  admin / homelabgrafana
+  /etc/hosts: añadido grafana.homelab.local a la línea existente
+
+DASHBOARDS VERIFICADOS
+  - Kubernetes / Compute Resources / Namespace (Pods): CPU y RAM de pods nginx y mariadb
+  - Node Exporter / Nodes: métricas del portátil (CPU, RAM, disco, red)
+
+OBSERVACIÓN IMPORTANTE — paneles "No data"
+  Los paneles "CPU/Memory Utilisation (from requests/limits)" muestran "No data"
+  porque calculan el porcentaje sobre los resource requests/limits configurados.
+  Como los pods aún no tienen resources definidos, no hay denominador.
+  Se poblarán en la Fase 7 cuando añadamos requests y limits.
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+  Ninguno.
+
+CONCEPTOS ASUMIDOS
+  Helm chart:
+    Paquete de manifiestos K8s parametrizables. El values.yaml sobreescribe los
+    valores por defecto del chart. Equivalente a un paquete .deb con debconf
+    para configuración. kube-prometheus-stack agrupa >20 manifiestos en un
+    solo comando de instalación.
+
+  Modelo pull de Prometheus:
+    Prometheus va activamente a buscar métricas a cada target en /metrics cada
+    N segundos (por defecto 30s). Los targets no envían datos — Prometheus los
+    recoge. Ventaja: Prometheus controla el ritmo y detecta targets caídos.
+    Analogía: en vez de que los agentes Zabbix envíen traps, Prometheus hace
+    polling activo a cada endpoint.
+
+  Exporter:
+    Proceso que expone métricas del sistema en formato texto Prometheus en /metrics.
+    node-exporter: métricas del SO (CPU, RAM, disco, red del nodo).
+    kube-state-metrics: métricas de objetos K8s (pods running, deployments, etc).
+    Analogía: agente SNMP que traduce el estado del sistema al formato del monitor.
+
+  ServiceMonitor (CRD):
+    Objeto K8s que le indica a Prometheus qué Services debe scrapear y cómo.
+    kube-prometheus-stack crea ServiceMonitors automáticamente para todos los
+    componentes del clúster. Analogía: añadir un host a la configuración de
+    Zabbix, pero de forma declarativa y autodescubierta.
+
+  Grafana sidecars (3/3 en el pod):
+    El pod de Grafana tiene 3 contenedores: grafana principal + sidecar-dashboards
+    (carga dashboards desde ConfigMaps) + sidecar-datasources (configura datasources
+    desde ConfigMaps). Patrón sidecar aplicado al propio stack de monitorización.
+
+
+================================================================================
+  FASE 7 — Hardening y buenas prácticas (resources, probes, HPA)
+================================================================================
+
+OBJETIVO
+  Añadir resources requests/limits, liveness/readiness probes y HPA a todos los
+  workloads. Demostrar el escalado automático bajo carga.
+
+FICHEROS MODIFICADOS / CREADOS
+  - manifests/nginx/deployment.yaml    → añadidos resources y probes a nginx y php-fpm
+  - manifests/mariadb/statefulset.yaml → añadidos resources y probes a mariadb
+  - manifests/nginx/hpa.yaml           → HPA para nginx (min 2, max 6, target 50% CPU)
+
+RESOURCES CONFIGURADOS
+  nginx:    requests cpu=50m  mem=64Mi  │ limits cpu=200m  mem=128Mi
+  php-fpm:  requests cpu=100m mem=128Mi │ limits cpu=500m  mem=256Mi
+  mariadb:  requests cpu=100m mem=256Mi │ limits cpu=500m  mem=512Mi
+  initContainer: requests cpu=50m mem=32Mi │ limits cpu=100m mem=64Mi
+
+PROBES CONFIGURADAS
+  nginx    → livenessProbe:  HTTP GET / :80  (delay 10s, period 15s, fail 3)
+             readinessProbe: HTTP GET / :80  (delay 5s,  period 10s, fail 2)
+  php-fpm  → livenessProbe:  TCP socket :9000 (delay 30s, period 15s, fail 3)
+             readinessProbe: TCP socket :9000 (delay 25s, period 10s, fail 2)
+  mariadb  → livenessProbe:  exec mariadb-admin ping (delay 30s, period 20s, fail 3)
+             readinessProbe: exec mariadb SELECT 1    (delay 20s, period 10s, fail 3)
+
+VERIFICACIÓN REALIZADA
+  Carga generada con pod busybox haciendo curl en bucle:
+    kubectl run loadgen --image=busybox:1.36 -n homelab --restart=Never -- \
+      sh -c "while true; do wget -q -O- http://nginx.homelab.svc.cluster.local > /dev/null; done"
+
+  Ciclo de escalado observado:
+    3 réplicas (base) → CPU 53%/50% → HPA escala a 5 réplicas
+    loadgen eliminado  → CPU 18%/50% → cooldown 5 min → HPA baja a 2 réplicas (mínimo)
+
+  Paneles de Grafana "No data" → ahora muestran porcentajes de CPU/RAM
+  sobre requests y limits en tiempo real.
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+  Ninguno.
+
+CONCEPTOS ASUMIDOS
+  Resources requests:
+    Lo que el pod garantiza necesitar. El scheduler compara los requests de todos
+    los pods con la capacidad de cada nodo y decide dónde colocar el pod.
+    Sin requests el scheduler coloca pods a ciegas y puede sobrecargar un nodo.
+    Analogía: plaza reservada en un parking — el scheduler sabe que está ocupada.
+
+  Resources limits:
+    Techo de consumo. Si un pod supera el límite de CPU → throttling (se ralentiza).
+    Si supera el límite de RAM → OOMKilled (el kernel mata el proceso).
+    Sin limits, un pod con memory leak puede tumbar el nodo entero.
+    Analogía: tamaño máximo del vehículo — no puedes ocupar más espacio del tuyo.
+
+  livenessProbe:
+    K8s comprueba periódicamente si el contenedor sigue vivo. Si falla N veces
+    consecutivas, mata y reinicia el contenedor. Detecta procesos colgados que
+    siguen en pie pero no responden.
+    Analogía: watchdog que reinicia el servicio si no responde al ping.
+
+  readinessProbe:
+    K8s comprueba si el contenedor está listo para recibir tráfico. Mientras falle,
+    el pod se elimina de los endpoints del Service (no recibe peticiones).
+    Un pod puede estar vivo (liveness OK) pero aún calentando (readiness KO).
+    Analogía: el "en servicio" de un servidor en un pool de HAProxy.
+
+  Tipos de probe:
+    httpGet:   hace una petición HTTP, espera código 2xx/3xx. Ideal para nginx.
+    tcpSocket: comprueba que el puerto TCP está abierto. Ideal para php-fpm (no HTTP).
+    exec:      ejecuta un comando dentro del contenedor. Ideal para MariaDB (cliente SQL).
+
+  HPA (HorizontalPodAutoscaler):
+    Observa métricas (CPU, RAM u otras via metrics-server) y ajusta el número de
+    réplicas entre minReplicas y maxReplicas para mantener el target.
+    scaleUp: agresivo (reacciona rápido para absorber carga).
+    scaleDown: conservador (cooldown de 5 min por defecto para evitar flapping).
+    Analogía: autoscaling group de AWS/GCP pero para pods.
+
+  Flapping:
+    Problema de oscilación continua (escalar arriba → abajo → arriba...) que
+    ocurre si el cooldown es demasiado corto. El período de estabilización de
+    5 minutos en scale-down evita este comportamiento.
+
+
+================================================================================
+  PRÓXIMA FASE: 8 (bonus) — GitOps con ArgoCD
+================================================================================

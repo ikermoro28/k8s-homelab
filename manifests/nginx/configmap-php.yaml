@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-php
+  namespace: homelab
+data:
+  index.php: |
+    <?php
+    // El DNS interno de K8s resuelve este nombre al Service de MariaDB
+    $host = 'mariadb.homelab.svc.cluster.local';
+    $user = getenv('DB_USER');
+    $pass = getenv('DB_PASSWORD');
+    $db   = getenv('DB_NAME');
+
+    $conn = new mysqli($host, $user, $pass, $db);
+
+    $db_status = 'ERROR';
+    $rows = [];
+    if (!$conn->connect_error) {
+      $db_status = 'CONECTADO';
+      $result = $conn->query("SELECT * FROM visitas ORDER BY fecha DESC LIMIT 5");
+      if ($result) {
+        while ($row = $result->fetch_assoc()) $rows[] = $row;
+      }
+    }
+    ?>
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>K8s Homelab</title>
+      <style>
+        body { font-family: monospace; background: #0d1117; color: #e6edf3; margin: 0; padding: 2rem; }
+        h1 { color: #58a6ff; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; }
+        .ok  { color: #3fb950; }
+        .err { color: #f85149; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { text-align: left; padding: 0.5rem 1rem; border-bottom: 1px solid #30363d; }
+        th { color: #8b949e; }
+      </style>
+    </head>
+    <body>
+      <h1>K8s Homelab — Fase 4</h1>
+
+      <div class="card">
+        <b>Pod:</b> <?= gethostname() ?><br>
+        <b>MariaDB:</b> <span class="<?= $db_status === 'CONECTADO' ? 'ok' : 'err' ?>">
+          <?= $db_status ?> — <?= $host ?>
+        </span>
+      </div>
+
+      <div class="card">
+        <table>
+          <tr><th>ID</th><th>Mensaje</th><th>Fecha</th></tr>
+          <?php foreach ($rows as $r): ?>
+          <tr>
+            <td><?= $r['id'] ?></td>
+            <td><?= htmlspecialchars($r['mensaje']) ?></td>
+            <td><?= $r['fecha'] ?></td>
+          </tr>
+          <?php endforeach; ?>
+          <?php if (empty($rows)): ?>
+          <tr><td colspan="3" class="err">Sin datos o error de conexión</td></tr>
+          <?php endif; ?>
+        </table>
+      </div>
+    </body>
+    </html>
+
+  nginx.conf: |
+    server {
+        listen 80;
+        root /var/www/html;
+        index index.php;
+
+        location ~ \.php$ {
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        }
+    }

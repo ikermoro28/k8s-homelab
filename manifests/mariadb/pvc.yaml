@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-pvc
+  namespace: homelab
+spec:
+  accessModes:
+    - ReadWriteOnce      # Solo un nodo puede montar este volumen a la vez (correcto para una BD)
+  resources:
+    requests:
+      storage: 1Gi
+  # Sin storageClassName → usa la StorageClass por defecto del clúster.
+  # k3d incluye "local-path" como default: crea un directorio en el nodo worker.
