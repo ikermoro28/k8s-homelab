@@ -66,7 +66,7 @@ manifests/
 └── argocd-app.yaml              # Application CRD — define el GitOps loop
 ```
 
-## Conceptos practicados
+## Conceptos asumidos
 
 - Pod, Deployment, ReplicaSet, StatefulSet, Service, ConfigMap, Secret, PVC, Ingress, HPA
 - Patrón initContainer + sidecar (nginx y php-fpm en el mismo pod)
