@@ -573,5 +573,129 @@ CONCEPTOS ASUMIDOS
 
 
 ================================================================================
-  PRÓXIMA FASE: 8 (bonus) — GitOps con ArgoCD
+  FASE 8 — GitOps con ArgoCD
+================================================================================
+
+OBJETIVO
+  Implementar GitOps: el repositorio GitHub es la fuente de verdad del clúster.
+  ArgoCD vigila el repo y sincroniza automáticamente cualquier cambio en los YAMLs.
+  El estado deseado vive en Git, no en la cabeza de nadie.
+
+REPOSITORIO
+  https://github.com/ikermoro28/k8s-homelab.git  (rama: main, path: manifests/)
+
+ARCHIVOS CREADOS/MODIFICADOS
+  manifests/ingress/ingress-argocd.yaml   → Ingress para acceder a la UI de ArgoCD
+  manifests/argocd-app.yaml               → Application CRD que define el GitOps loop
+
+ARQUITECTURA GITOPS
+  Git (GitHub) → ArgoCD repo-server (clona el repo cada 3 min)
+              → ArgoCD application-controller (compara estado deseado vs real)
+              → kubectl apply automático si hay drift
+  URL UI: http://argocd.homelab.local:8080
+
+CONFIGURACIÓN CLAVE
+  - repoURL: https://github.com/ikermoro28/k8s-homelab.git
+  - path: manifests/   (ArgoCD gestiona todos los YAMLs de esta carpeta)
+  - syncPolicy.automated.prune: true      → borra recursos eliminados del repo
+  - syncPolicy.automated.selfHeal: true   → revierte cambios manuales fuera de Git
+  - argocd-cmd-params-cm: server.insecure: "true" → UI en HTTP (sin TLS interno)
+  - Ingress con traefik.ingress.kubernetes.io/router.entrypoints: web
+
+VERIFICACIÓN
+  - UI accesible en http://argocd.homelab.local:8080
+  - App "homelab": Healthy + Synced to main
+  - Auto sync habilitado
+  - Namespaces homelab y monitoring visibles como recursos gestionados
+
+ERRORES ENCONTRADOS Y SOLUCIONES
+
+  ERROR 1: 404 "page not found" al acceder a argocd.homelab.local:8080
+  Causa: El pod argocd-server redirigía HTTP→HTTPS internamente. El Ingress de
+         Traefik enviaba tráfico HTTP al puerto 80 del service, pero argocd-server
+         respondía con redirect 301 a HTTPS.
+  Solución aplicada en dos pasos:
+    1. Añadir server.insecure: "true" al ConfigMap argocd-cmd-params-cm (env var
+       ARGOCD_SERVER_INSECURE que el pod lee al arrancar).
+    2. Restaurar command: ["/usr/local/bin/argocd-server"] en el deployment
+       (un patch previo mal formado había eliminado el command, dejando solo tini
+       sin binario que ejecutar → CrashLoopBackOff con "exec --insecure failed").
+
+  ERROR 2: CrashLoopBackOff en argocd-server tras patch --insecure
+  Causa: Se aplicó kubectl patch con op:add en /args = ["--insecure"]. Esto
+         sobreescribió el CMD del contenedor Docker pero no el command. Tini
+         (entrypoint de la imagen ArgoCD) recibió "--insecure" como programa a
+         ejecutar en lugar de "/usr/local/bin/argocd-server".
+  Solución:
+    kubectl patch deployment argocd-server -n argocd --type json \
+      -p='[{"op":"remove","path":"/spec/template/spec/containers/0/args"}]'
+    kubectl patch deployment argocd-server -n argocd --type json \
+      -p='[{"op":"add","path":"/spec/template/spec/containers/0/command",
+            "value":["/usr/local/bin/argocd-server"]}]'
+  Lección: Para pasar flags a ArgoCD, usar la variable de entorno
+           ARGOCD_SERVER_INSECURE via argocd-cmd-params-cm, nunca parchear args
+           directamente (el entrypoint tini gestiona el binario, no K8s).
+
+  ERROR 3: applicationset-controller en CrashLoopBackOff
+  Causa: Race condition al instalar ArgoCD. El controller arrancó antes de que
+         el CRD ApplicationSet (argoproj.io/v1alpha1) estuviera registrado.
+  Solución: kubectl rollout restart deployment argocd-applicationset-controller -n argocd
+
+  ERROR 4: "revision main must be resolved" en la app homelab
+  Causa: El repositorio GitHub estaba configurado como privado. ArgoCD no tenía
+         credenciales para clonarlo.
+  Solución: Cambiar el repo a público en GitHub Settings.
+
+CONCEPTOS ASUMIDOS
+
+  GitOps:
+    Filosofía operacional donde Git es la única fuente de verdad del sistema.
+    Cualquier cambio en infraestructura pasa por un commit y PR, nunca por comandos
+    manuales directos al clúster. Beneficios: trazabilidad, rollback trivial,
+    revisión de cambios, CI/CD declarativo.
+    Analogía: como tener /etc en Git con apply automático al hacer merge.
+
+  ArgoCD Application CRD:
+    Recurso propio de ArgoCD (argoproj.io/v1alpha1) que define:
+    - source: dónde está el YAML deseado (repo, rama, path)
+    - destination: dónde aplicarlo (clúster + namespace)
+    - syncPolicy: cuándo y cómo sincronizar (manual, automático, con prune)
+    Es el "contrato" entre Git y el clúster.
+
+  Sync / Drift:
+    Sync = el clúster tiene exactamente lo que dice el repo.
+    Drift = alguien hizo kubectl apply/delete sin pasar por Git. Con selfHeal,
+    ArgoCD lo detecta y revierte en el siguiente ciclo de reconciliación (~3 min).
+
+  prune: true:
+    Si borras un YAML del repo, ArgoCD borra el recurso del clúster en el próximo
+    sync. Sin prune, los recursos huérfanos se quedan para siempre.
+    Analogía: como que Terraform destruya lo que quitaste del .tf.
+
+  selfHeal: true:
+    Si alguien hace kubectl delete pod o modifica un deployment a mano, ArgoCD lo
+    revierte al estado del repo. El clúster es inmutable desde fuera de Git.
+
+  argocd-cmd-params-cm:
+    ConfigMap especial de ArgoCD que configura los flags de arranque de cada
+    componente via variables de entorno. Más seguro que parchear el Deployment:
+    los cambios se aplican con un rollout restart, sin tocar la spec del pod.
+
+  Tini (init process):
+    Proceso init ligero usado como ENTRYPOINT en muchas imágenes de producción.
+    Gestiona señales Unix correctamente y recoge procesos zombie. El binario real
+    (argocd-server) es el CMD que tini lanza. Si se sobreescribe args sin command,
+    tini intenta ejecutar el arg como binario → crash.
+
+
+================================================================================
+  PROYECTO COMPLETADO
+================================================================================
+  Fases 0-8 completadas. Clúster productivo con:
+  - k3d multi-nodo (1 server + 2 agents)
+  - Nginx + PHP-FPM + MariaDB (StatefulSet con persistencia)
+  - Traefik como Ingress Controller
+  - Prometheus + Grafana (monitorización)
+  - Resources, Probes y HPA (hardening)
+  - ArgoCD (GitOps — GitHub como fuente de verdad)
 ================================================================================
