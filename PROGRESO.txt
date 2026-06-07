@@ -689,6 +689,231 @@ CONCEPTOS ASUMIDOS
 
 
 ================================================================================
+  SESIÓN DE TROUBLESHOOTING — DNS, ImagePullBackOff y CrashLoopBackOff
+================================================================================
+
+SÍNTOMA INICIAL
+  Al arrancar el clúster, Grafana funcionaba pero la web (homelab.local) y ArgoCD
+  (argocd.homelab.local) mostraban "no available server" o error de conexión.
+
+────────────────────────────────────────────────────────────────────────────────
+  PROBLEMA 1 — ArgoCD en ImagePullBackOff
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR
+  Todos los pods de ArgoCD en ImagePullBackOff. Ejemplo:
+    Warning Failed: spec.containers{argocd-server}: Error: ErrImagePull
+    Back-off pulling image "quay.io/argoproj/argocd:v3.4.3"
+
+CAUSA RAÍZ — DNS de Docker roto por Tailscale
+  k3d ejecuta los nodos del clúster como contenedores Docker. Docker genera
+  automáticamente el /etc/resolv.conf de esos contenedores apuntando al gateway
+  de su red bridge (172.18.0.1) como nameserver:
+
+    nameserver 172.18.0.1
+    search tailb596b9.ts.net    ← añadido por Tailscale
+    options ndots:0
+
+  El comentario del fichero decía "NO EXTERNAL NAMESERVERS DEFINED". Tailscale
+  había tomado el resolver del host (systemd-resolved) y lo configuró para
+  resolver solo dominios Tailscale. Docker hereda esa config para sus contenedores,
+  así que 172.18.0.1 devuelve SERVFAIL para cualquier dominio externo como
+  quay.io, ghcr.io o dl-cdn.alpinelinux.org.
+
+  Verificación:
+    docker exec k3d-homelab-server-0 nslookup quay.io          → SERVFAIL
+    docker exec k3d-homelab-server-0 nslookup quay.io 8.8.8.8  → OK (resuelve)
+
+  Por eso Grafana sí funcionaba: sus pods ya tenían las imágenes descargadas
+  antes de que se rompiera el DNS. ArgoCD necesitaba descargar imágenes nuevas
+  y fallaba al no poder resolver los registros DNS de los registries.
+
+SOLUCIÓN APLICADA (rápida, sin recrear el clúster)
+  1. Descargar las imágenes en el HOST (que sí tiene internet):
+       docker pull quay.io/argoproj/argocd:v3.4.3
+       docker pull ghcr.io/dexidp/dex:v2.45.0
+       docker pull public.ecr.aws/docker/library/redis:8.2.3-alpine
+
+  2. Importar las imágenes al almacén containerd de los nodos k3d:
+       k3d image import quay.io/argoproj/argocd:v3.4.3 \
+                        ghcr.io/dexidp/dex:v2.45.0 \
+                        public.ecr.aws/docker/library/redis:8.2.3-alpine \
+                        -c homelab
+
+  3. Cambiar imagePullPolicy de Always → IfNotPresent en todos los deployments
+     y el statefulset de ArgoCD:
+       kubectl patch deployment argocd-server -n argocd --type=json \
+         -p='[{"op":"replace","path":".../imagePullPolicy","value":"IfNotPresent"}]'
+       (repetido para los 6 deployments + 1 statefulset)
+
+     Sin este cambio, K8s intenta descargar la imagen del registro remoto SIEMPRE,
+     ignorando la copia local, y vuelve a fallar.
+
+SOLUCIÓN PERMANENTE (pendiente de aplicar)
+  Añadir DNS externos al daemon de Docker para que los contenedores resuelvan
+  dominios externos sin depender del resolver del host:
+
+    /etc/docker/daemon.json:
+      "dns": ["8.8.8.8", "1.1.1.1"]
+
+  Después: sudo systemctl restart docker && k3d cluster start homelab
+  Tras reiniciar Docker, k3d se para y hay que arrancarlo explícitamente.
+
+────────────────────────────────────────────────────────────────────────────────
+  PROBLEMA 2 — Nginx en CrashLoopBackOff (dos causas distintas)
+────────────────────────────────────────────────────────────────────────────────
+
+CAUSA A — docker-php-ext-install falló sin internet
+
+  El contenedor php-fpm tenía este command en el Deployment:
+    command: ["sh", "-c", "docker-php-ext-install mysqli && php-fpm -F"]
+
+  docker-php-ext-install descarga paquetes de compilación de los repositorios
+  Alpine (gcc, autoconf, make, etc.) para compilar la extensión mysqli en tiempo
+  de arranque del pod. Sin acceso a dl-cdn.alpinelinux.org (mismo problema DNS),
+  el comando fallaba inmediatamente y el contenedor salía con error → CrashLoopBackOff.
+
+  SOLUCIÓN: Construir una imagen personalizada en el HOST con la extensión ya
+  compilada, y usarla en lugar de compilar en cada arranque:
+
+    Dockerfile.php-mysqli:
+      FROM php:8.3-fpm-alpine
+      RUN docker-php-ext-install mysqli
+
+    docker build -t php:8.3-fpm-alpine-mysqli .
+    k3d image import php:8.3-fpm-alpine-mysqli -c homelab
+
+  Deployment actualizado:
+    image: php:8.3-fpm-alpine-mysqli
+    command: ["php-fpm", "-F"]   ← ya no hay instalación en tiempo de arranque
+
+  Ventaja adicional: los pods arrancan en segundos en lugar de ~30s.
+
+CAUSA B — readinessProbe de nginx dependía de PHP-FPM
+
+  La readinessProbe de nginx hacía GET / en el puerto 80. Pero la configuración
+  de nginx servía únicamente ficheros .php via FastCGI a localhost:9000 (php-fpm).
+  No había ninguna ruta estática que nginx pudiera responder por sí solo.
+
+  El problema de timing:
+    - nginx readinessProbe: initialDelaySeconds=5  → empieza a comprobar a los 5s
+    - php-fpm readinessProbe: initialDelaySeconds=25 → php-fpm puede no estar listo
+
+    Secuencia de fallos:
+      t=5s  → kubelet hace GET / → nginx intenta FastCGI a php-fpm → php-fpm no escucha
+              → nginx se queda esperando → kubelet cierra la conexión por timeout → 499
+      t=15s → segundo fallo → failureThreshold=2 superado
+              → K8s envía SIGQUIT a nginx → nginx sale limpiamente (código 0, "Completed")
+      → K8s ve "Completed" y reinicia el contenedor → bucle infinito (CrashLoopBackOff)
+
+  Por eso los logs mostraban nginx arrancando bien, sirviendo peticiones con 499,
+  y luego apagándose ordenadamente: no era un crash, era K8s matándolo a propósito.
+
+  SOLUCIÓN: Añadir un endpoint /health estático en nginx que responde sin tocar
+  php-fpm, y apuntar las probes a ese endpoint:
+
+    nginx.conf (añadido):
+      location /health {
+          return 200 "ok\n";
+          add_header Content-Type text/plain;
+      }
+
+    Deployment (probes actualizadas):
+      livenessProbe:  httpGet path: /health
+      readinessProbe: httpGet path: /health
+
+  Ahora nginx puede declararse "ready" independientemente de php-fpm.
+
+────────────────────────────────────────────────────────────────────────────────
+  PROBLEMA 3 — Web mostraba error mysqli DNS "Try again"
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR EN LA WEB
+  Warning: mysqli::__construct(): php_network_getaddresses:
+  getaddrinfo for mariadb.homelab.svc.cluster.local failed: Try again
+
+CAUSA — SERVFAIL de Tailscale en la cadena de búsqueda DNS
+
+  El /etc/resolv.conf generado por K8s dentro de los pods tiene:
+    nameserver 10.43.0.10   ← CoreDNS del clúster (correcto)
+    search homelab.svc.cluster.local svc.cluster.local cluster.local tailb596b9.ts.net
+    options ndots:5
+
+  Con ndots:5, el nombre "mariadb.homelab.svc.cluster.local" tiene solo 4 puntos
+  (< 5), así que la librería libc NO lo trata como FQDN directamente. En su lugar
+  prueba PRIMERO cada search domain en orden:
+
+    1. mariadb.homelab.svc.cluster.local.homelab.svc.cluster.local → NXDOMAIN
+    2. mariadb.homelab.svc.cluster.local.svc.cluster.local         → NXDOMAIN
+    3. mariadb.homelab.svc.cluster.local.cluster.local             → NXDOMAIN
+    4. mariadb.homelab.svc.cluster.local.tailb596b9.ts.net         → SERVFAIL ←!
+    5. mariadb.homelab.svc.cluster.local                           → nunca llega aquí
+
+  En el paso 4, CoreDNS pregunta al upstream por tailb596b9.ts.net. Ese upstream
+  es el resolver de Tailscale (172.18.0.1), que devuelve SERVFAIL (error de servidor)
+  en lugar de NXDOMAIN (dominio no existe). La diferencia es crítica:
+    - NXDOMAIN → "no existe, prueba el siguiente search domain"
+    - SERVFAIL  → "error del servidor" → getaddrinfo aborta y devuelve EAI_AGAIN
+
+  Por eso nslookup sí funcionaba (consulta directamente sin seguir search domains)
+  pero PHP fallaba (usa getaddrinfo de libc que sí sigue el proceso ndots/search).
+
+  Verificación:
+    kubectl exec ... -- nslookup mariadb.homelab.svc.cluster.local  → OK (resuelve)
+    kubectl exec ... -- php -r "new mysqli('mariadb.homelab...')"    → falla
+
+SOLUCIÓN: Usar el nombre corto "mariadb" en lugar del FQDN.
+
+  Con el nombre corto "mariadb" (0 puntos, < ndots:5), la libc prueba el primer
+  search domain directamente:
+    mariadb.homelab.svc.cluster.local  → CoreDNS lo resuelve en su zona cluster.local
+    → devuelve la IP del pod → conexión exitosa
+
+  Al resolverse en el primer intento, nunca llega al search domain de Tailscale.
+
+  configmap-php.yaml:
+    $host = 'mariadb';   ← antes era 'mariadb.homelab.svc.cluster.local'
+
+FICHEROS MODIFICADOS EN ESTA SESIÓN
+  manifests/nginx/deployment.yaml
+    - image: php:8.3-fpm-alpine → php:8.3-fpm-alpine-mysqli
+    - command: eliminado docker-php-ext-install, ahora solo ["php-fpm", "-F"]
+    - livenessProbe/readinessProbe de nginx: path / → /health
+
+  manifests/nginx/configmap-php.yaml
+    - nginx.conf: añadido location /health { return 200 "ok\n"; }
+    - index.php: $host = 'mariadb.homelab.svc.cluster.local' → 'mariadb'
+
+  (nuevo) k8s-homelab/Dockerfile.php-mysqli
+    - FROM php:8.3-fpm-alpine + RUN docker-php-ext-install mysqli
+    - Imagen construida localmente e importada en k3d
+
+LECCIONES APRENDIDAS
+
+  1. Docker hereda la config DNS del host. Si el host usa un resolver privado
+     (Tailscale, VPN, etc.), los contenedores no pueden resolver dominios públicos.
+     Solución: fijar "dns" en /etc/docker/daemon.json con servidores externos.
+
+  2. imagePullPolicy: Always obliga a contactar el registry en cada arranque de pod.
+     En entornos sin internet fiable, usar IfNotPresent y gestionar las imágenes
+     con k3d image import (o un registry local como registry.k3d.io).
+
+  3. Las readinessProbes de contenedores en el mismo pod deben ser independientes.
+     Si nginx depende de php-fpm para responder, la probe de nginx debe apuntar a
+     un endpoint que nginx pueda servir solo (/health estático), no a uno que
+     requiera que otro contenedor esté listo primero.
+
+  4. SERVFAIL ≠ NXDOMAIN en resolución DNS. NXDOMAIN permite continuar la búsqueda
+     en el siguiente search domain. SERVFAIL la aborta. Un search domain que genera
+     SERVFAIL (como un dominio de Tailscale consultado a CoreDNS) puede romper la
+     resolución de nombres internos de K8s aunque CoreDNS esté perfectamente sano.
+
+  5. En K8s, los nombres cortos (sin puntos) son más robustos que los FQDNs cuando
+     hay search domains problemáticos, porque la libc prueba primero el search domain
+     del namespace actual (homelab.svc.cluster.local), que es exactamente lo que
+     queremos, sin pasar por los dominios externos de la lista.
+
+================================================================================
   PROYECTO COMPLETADO
 ================================================================================
   Fases 0-8 completadas. Clúster productivo con:
