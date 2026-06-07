@@ -1,0 +1,443 @@
+================================================================================
+  K8S HOMELAB — DIARIO DE MEJORA
+================================================================================
+Proyecto: Clúster Kubernetes local con k3d
+Hardware: MSI i7-11800H, 32GB RAM, RTX 3060 Mobile, Ubuntu 24.04
+Objetivo: Reemplazar la web placeholder por dos aplicaciones reales de uso
+          empresarial: FreeScout (helpdesk/ticketing) y Uptime Kuma (status page
+          y monitorización de servicios).
+
+Infraestructura previa (NO modificada salvo integración):
+  - Clúster k3d "homelab": 1 server + 2 agents, puertos 8080:80 / 8443:443
+  - Namespaces: homelab, monitoring, traefik, argocd
+  - MariaDB: StatefulSet con PVC (db: homelabdb, user: homelabuser)
+  - Nginx + PHP-FPM: Deployment con 3 réplicas → A REEMPLAZAR
+  - Traefik: Ingress Controller (Helm, namespace traefik)
+  - Prometheus + Grafana: kube-prometheus-stack (namespace monitoring)
+  - ArgoCD: GitOps apuntando a https://github.com/ikermoro28/k8s-homelab.git
+
+
+================================================================================
+  BLOQUE A — FREESCOUT (Plataforma de Helpdesk)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  A1 — Preparar la base de datos para FreeScout
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Crear una base de datos "freescout" y un usuario dedicado "freescoutuser"
+  dentro de la instancia MariaDB existente, y almacenar las credenciales en
+  un Secret de Kubernetes.
+
+QUÉ SE HIZO
+  1. Acceso al pod mariadb-0 via kubectl exec para ejecutar SQL directamente.
+  2. Creación de la base de datos con el charset correcto para una app PHP:
+       CREATE DATABASE freescout CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+     utf8mb4 es imprescindible para soportar emojis y caracteres Unicode completos
+     (utf8 en MySQL/MariaDB es en realidad utf8mb3, trunca a 3 bytes).
+  3. Creación del usuario con acceso restringido solo a esa BD:
+       CREATE USER 'freescoutuser'@'%' IDENTIFIED BY 'freescoutpass';
+       GRANT ALL PRIVILEGES ON freescout.* TO 'freescoutuser'@'%';
+  4. Creación del Secret de K8s "freescout-db-secret" con las 4 claves:
+       db-host / db-name / db-user / db-pass (valores en base64).
+
+FICHEROS CREADOS
+  - manifests/freescout/secret.yaml  → Secret con credenciales de BD
+
+POR QUÉ UN USUARIO DEDICADO POR APLICACIÓN
+  Es el principio de mínimo privilegio aplicado a bases de datos. La instancia
+  MariaDB actúa como servidor multi-tenant: múltiples aplicaciones comparten
+  el mismo proceso de BD pero cada una tiene su propia BD y su propio usuario
+  con acceso exclusivo a ella.
+
+  Si FreeScout tuviera una vulnerabilidad (inyección SQL, RCE) y un atacante
+  ejecutara comandos en la BD, con "freescoutuser" solo podría leer/escribir
+  en la BD "freescout". Con "root" o "homelabuser" podría afectar también a
+  "homelabdb" y destruir datos de otras aplicaciones. En empresas con decenas
+  de apps en el mismo servidor de BD, este aislamiento es estándar.
+
+CONCEPTOS ASUMIDOS
+  Secret de Kubernetes:
+    - Los Secrets almacenan datos sensibles (contraseñas, tokens, claves)
+      separados de los manifiestos de las aplicaciones.
+    - Los valores se guardan en base64, que es ENCODING, no cifrado.
+      Cualquiera con acceso al namespace puede decodificarlos con:
+        kubectl get secret freescout-db-secret -n homelab -o yaml
+      Para cifrado real se usaría Sealed Secrets o External Secrets Operator.
+    - Las aplicaciones los consumen via env vars (valueFrom.secretKeyRef) o
+      como ficheros montados en un volumen.
+    - Analogía sysadmin: es como un fichero .env que solo pueden leer los
+      procesos con permisos de RBAC sobre ese namespace.
+
+  Multi-tenant database server:
+    - Una sola instancia de MariaDB sirve a varias aplicaciones.
+    - Cada aplicación tiene su propia BD y su propio usuario.
+    - Patrón habitual en empresas para reducir el overhead operativo de
+      mantener múltiples instancias de BD.
+
+VERIFICACIÓN REALIZADA
+  - kubectl get secret → Secret existe en namespace homelab
+  - SHOW TABLES en freescout → BD existe con charset utf8mb4
+  - Conexión con freescoutuser → solo ve la BD "freescout" (aislamiento OK)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  A2 — Desplegar FreeScout
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Desplegar FreeScout como Deployment en el namespace homelab con persistencia,
+  Service ClusterIP, resources y probes.
+
+QUÉ SE HIZO
+  1. PVC "freescout-data" (5Gi, ReadWriteOnce) montado en /data.
+     FreeScout guarda en /data: adjuntos de tickets, módulos descargados,
+     caché persistente y ficheros de sesión.
+  2. Deployment con imagen tiredofit/freescout:latest, variables de entorno
+     tomadas del Secret (DB_HOST/DB_NAME/DB_USER/DB_PASS) y variables estáticas
+     (SITE_URL, ADMIN_EMAIL, ADMIN_PASS, SETUP_TYPE=AUTO).
+  3. Service ClusterIP "freescout" en puerto 80 — punto de entrada interno
+     para Traefik (Ingress) y para otros servicios del clúster.
+  4. Resources: requests 100m/256Mi, limits 500m/512Mi.
+  5. Probes tcpSocket en puerto 80 (ver sección PROBLEMAS).
+
+FICHEROS CREADOS
+  - manifests/freescout/pvc.yaml         → PVC de 5Gi para /data
+  - manifests/freescout/deployment.yaml  → Deployment con 1 réplica
+  - manifests/freescout/service.yaml     → Service ClusterIP puerto 80
+
+VARIABLES DE ENTORNO RELEVANTES DE tiredofit/freescout
+  DB_HOST         → host de la BD (nombre corto "mariadb", ver nota DNS)
+  DB_NAME         → nombre de la BD ("freescout")
+  DB_USER         → usuario de la BD
+  DB_PASS         → contraseña de la BD
+  SITE_URL        → URL pública de la app (usada por Laravel para generar URLs)
+  ADMIN_EMAIL     → email del usuario administrador creado en el primer arranque
+  ADMIN_PASS      → contraseña del admin
+  SETUP_TYPE=AUTO → ejecuta migraciones y crea el admin automáticamente
+  ENABLE_AUTO_UPDATE=FALSE → desactiva el autoupdate en cada arranque del pod
+                             (en K8s se gestiona cambiando la imagen, no desde dentro)
+
+  Nota sobre DB_HOST: se usa el nombre corto "mariadb" (sin FQDN) para evitar
+  el problema de Tailscale/DNS que se documentó en PROGRESO.txt (SERVFAIL al
+  intentar resolver dominios con el search domain de Tailscale).
+
+POR QUÉ 1 RÉPLICA EN VEZ DE 3
+  FreeScout gestiona sesiones de usuario en ficheros locales del contenedor
+  (en /data). Si hubiera 3 réplicas y una petición HTTP iba al pod A (que tiene
+  la sesión) y la siguiente al pod B (que no la tiene), el usuario vería su
+  sesión cerrada entre peticiones. Para escalar horizontalmente apps con estado
+  de sesión se necesitan sticky sessions (afinidad de pod en el Ingress) o
+  almacenar las sesiones en un backend compartido (Redis, BD). Esto se aborda
+  en la fase A5.
+
+CONCEPTOS ASUMIDOS
+  PVC (PersistentVolumeClaim):
+    - Solicitud de almacenamiento persistente. El StorageClass "local-path"
+      de k3d lo satisface creando un directorio en el nodo host.
+    - ReadWriteOnce (RWO) significa que solo un nodo puede montarlo a la vez,
+      consistente con tener 1 réplica.
+    - Analogía: es como montar un disco duro externo en el contenedor. Si el
+      pod muere y se recrea, el nuevo pod monta el mismo disco y encuentra
+      los datos intactos.
+
+  Service ClusterIP:
+    - IP virtual accesible solo dentro del clúster. Actúa como balanceador
+      interno que distribuye tráfico entre los pods que cumplan el selector.
+    - Analogía sysadmin: VIP interno de HAProxy. Los clientes internos (Traefik,
+      Uptime Kuma) conectan a la IP del Service, no a la IP del pod directamente.
+    - El DNS interno de K8s resuelve "freescout.homelab.svc.cluster.local"
+      a esta IP automáticamente.
+
+  SETUP_TYPE=AUTO en tiredofit/freescout:
+    - En el primer arranque, la imagen detecta una BD vacía y ejecuta
+      automáticamente: migraciones SQL, creación del usuario admin, instalación
+      de módulos base.
+    - Resultado: 25 tablas creadas en la BD "freescout" y el usuario
+      admin@homelab.local disponible para login.
+
+────────────────────────────────────────────────────────────────────────────────
+  PROBLEMA — Probes HTTP devolvían 403
+────────────────────────────────────────────────────────────────────────────────
+
+SÍNTOMA
+  El pod arrancaba (logs mostraban "Initialization Complete"), pero entraba en
+  CrashLoopBackOff. Los eventos del pod mostraban:
+    Readiness probe failed: HTTP probe failed with statuscode: 403
+    Liveness probe failed: HTTP probe failed with statuscode: 403
+
+CAUSA
+  Las probes de K8s (kubelet) hacen peticiones HTTP directamente a la IP del
+  pod: GET http://<pod-ip>:80/
+
+  FreeScout es una aplicación Laravel. Laravel valida el header "Host" de cada
+  petición contra la lista de hosts permitidos derivada de APP_URL/SITE_URL.
+  Como SITE_URL="http://helpdesk.homelab.local:8080" y el kubelet enviaba como
+  Host la IP del pod (ej. 10.42.1.5), Laravel rechazaba la petición con 403
+  ("Invalid Host header").
+
+  Este es un comportamiento de seguridad intencionado de Laravel para prevenir
+  ataques de Host Header Injection.
+
+  El mismo problema se reproduce con curl desde fuera sin el Host correcto:
+    curl http://localhost:8888/       → 403
+    curl -H "Host: helpdesk.homelab.local" http://localhost:8888/ → 200
+
+SOLUCIÓN
+  Cambiar las probes de httpGet a tcpSocket. En lugar de hacer una petición
+  HTTP completa, K8s simplemente comprueba que el puerto 80 acepta conexiones
+  TCP. Esto es suficiente para verificar que nginx y php-fpm están vivos y
+  escuchando, sin necesidad de que Laravel procese la petición.
+
+  Antes (fallaba):
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 80
+
+  Después (funciona):
+    livenessProbe:
+      tcpSocket:
+        port: 80
+
+  Analogía: en vez de llamar por teléfono y esperar que contesten (HTTP),
+  compruebas que el teléfono tiene línea (TCP). Para una probe de vitalidad
+  es información suficiente.
+
+LECCIÓN APRENDIDA
+  Las probes HTTP no son universales. Apps con validación estricta del Host
+  header (Laravel, Django con ALLOWED_HOSTS, etc.) requieren o bien:
+    a) tcpSocket probe (verifica que el proceso escucha)
+    b) Un endpoint de health dedicado que no haga validación de host
+       (ej. /healthz que responda siempre 200 sin pasar por el router)
+  La opción (b) es más robusta porque verifica que la app realmente procesa
+  peticiones, no solo que el puerto está abierto.
+
+VERIFICACIÓN FINAL A2
+  - Pod freescout: 1/1 Running, 0 restarts
+  - PVC freescout-data: Bound (5Gi)
+  - Service freescout: ClusterIP 10.43.123.250:80
+  - 25 tablas en BD freescout (migraciones ejecutadas)
+  - Usuario admin@homelab.local creado en BD
+  - HTTP 200 con Host header correcto desde port-forward
+
+
+────────────────────────────────────────────────────────────────────────────────
+  A3 — Configurar Ingress para FreeScout
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Exponer FreeScout al exterior del clúster via Traefik bajo el dominio
+  helpdesk.homelab.local:8080, accesible desde el navegador del host.
+
+QUÉ SE HIZO
+  1. Creación del recurso Ingress "freescout-ingress" en namespace homelab.
+     Regla: Host "helpdesk.homelab.local" → Service "freescout" puerto 80.
+  2. Añadido "helpdesk.homelab.local" a /etc/hosts del host:
+       127.0.0.1 helpdesk.homelab.local
+
+FICHEROS CREADOS
+  - manifests/freescout/ingress.yaml  → Ingress con regla de host
+
+POR QUÉ EL INGRESS VA EN manifests/freescout/ Y NO EN manifests/ingress/
+  Se opta por colocar cada recurso junto a la aplicación que lo necesita
+  (cohesión por aplicación) en lugar de agrupar todos los Ingresses en una
+  carpeta central. Ventaja: cuando se elimine o mueva FreeScout, todos sus
+  recursos (Deployment, Service, PVC, Secret, Ingress) están en el mismo
+  directorio. Es el mismo principio que agrupar los ficheros de un microservicio
+  en un repositorio propio en lugar de mezclarlos con otros servicios.
+
+CÓMO FUNCIONA EL FLUJO DE TRÁFICO
+  Navegador → localhost:8080 → k3d-homelab-serverlb (puerto 8080 del host)
+  → Traefik (namespace traefik) → lee las reglas Ingress del clúster
+  → detecta Host: helpdesk.homelab.local → forwarding al Service "freescout"
+  → ClusterIP 10.43.123.250:80 → pod freescout
+
+  Traefik actúa como proxy inverso dinámico: lee continuamente los recursos
+  Ingress de la API de K8s y actualiza su configuración sin reiniciarse.
+  Analogía sysadmin: es como un nginx con reload automático cada vez que
+  cambias un VirtualHost.
+
+CONCEPTOS ASUMIDOS
+  Ingress vs Service:
+    - Service (ClusterIP): red interna del clúster. Solo accesible entre pods.
+    - Ingress: regla que le dice al Ingress Controller (Traefik) cómo enrutar
+      tráfico externo hacia un Service interno, basándose en el Host header
+      o la ruta URL.
+    - Se pueden tener decenas de aplicaciones con sus propios Services, y un
+      solo Ingress Controller que las expone todas en el mismo puerto (80/443)
+      discriminando por dominio. Analogía: un servidor nginx con múltiples
+      VirtualHosts, pero configurado automáticamente desde la API de K8s.
+
+  ingressClassName: traefik:
+    - Le dice a K8s qué Ingress Controller debe procesar esta regla.
+    - Si hubiera varios controllers (ej. nginx + traefik), cada Ingress
+      declara explícitamente cuál debe gestionarlo.
+
+  /etc/hosts en el host:
+    - k3d expone el puerto 8080 del host al load balancer interno del clúster.
+    - Para que el navegador resuelva "helpdesk.homelab.local" a 127.0.0.1
+      (y así llegar al puerto 8080 de k3d) hay que añadir la entrada en
+      /etc/hosts. Sin esto, el sistema intentaría resolver el dominio via DNS
+      real y fallaría.
+
+VERIFICACIÓN REALIZADA
+  - curl http://helpdesk.homelab.local:8080/login → HTTP 200
+  - UI de FreeScout accesible en el navegador
+  - Login con admin@homelab.local / Admin1234! funciona
+
+
+================================================================================
+  BLOQUE B — UPTIME KUMA (Status Page y Monitorización)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  B1 — Desplegar Uptime Kuma
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Desplegar Uptime Kuma como Deployment en el namespace homelab con persistencia
+  para su base de datos SQLite interna.
+
+QUÉ SE HIZO
+  1. PVC "uptime-kuma-data" (1Gi, ReadWriteOnce) montado en /app/data.
+     Uptime Kuma guarda en /app/data: la BD SQLite con el historial de checks,
+     configuración de monitores y credenciales de la UI.
+  2. Deployment con imagen louislam/uptime-kuma:1, puerto 3001.
+     Resources: requests 100m/128Mi, limits 500m/256Mi.
+  3. Probes httpGet en puerto 3001 path "/" — Uptime Kuma (Node.js/Express)
+     no valida el header Host de forma restrictiva, así que httpGet funciona
+     directamente a diferencia de FreeScout (Laravel).
+  4. Service ClusterIP "uptime-kuma" en puerto 3001.
+
+FICHEROS CREADOS
+  - manifests/uptime-kuma/pvc.yaml         → PVC de 1Gi para /app/data
+  - manifests/uptime-kuma/deployment.yaml  → Deployment con 1 réplica
+  - manifests/uptime-kuma/service.yaml     → Service ClusterIP puerto 3001
+
+POR QUÉ SQLITE Y NO MARIADB
+  Uptime Kuma fue diseñado para ser un proceso único (1 réplica) sin dependencias
+  externas. Su BD SQLite vive en el mismo PVC que los datos, lo que simplifica
+  el despliegue: no hay que crear BD ni usuario en MariaDB, no hay Secret que
+  gestionar, y el backup se reduce a copiar el PVC.
+  El trade-off es que SQLite no escala horizontalmente, pero Uptime Kuma nunca
+  va a tener más de 1 réplica (es un monitor centralizado por diseño).
+
+POR QUÉ 1Gi EN VEZ DE 5Gi (como FreeScout)
+  Uptime Kuma solo almacena métricas de disponibilidad (timestamps + latencia
+  en ms + status). Sin adjuntos ni ficheros de sesión, 1Gi es más que suficiente
+  para años de historial de checks cada 60 segundos.
+
+CONCEPTOS ASUMIDOS
+  SQLite en Kubernetes:
+    - SQLite es una BD de fichero único. En K8s funciona bien mientras haya
+      solo 1 pod accediendo al fichero (RWO garantiza esto).
+    - Si hubiera varias réplicas necesitaría un backend que soporte acceso
+      concurrente (PostgreSQL, MySQL). SQLite con varios writers simultáneos
+      produce corrupción de datos.
+    - Para apps de un solo proceso (Uptime Kuma, Gitea, etc.) SQLite es la
+      opción más operacionalmente simple en K8s.
+
+VERIFICACIÓN REALIZADA
+  - Pod uptime-kuma: 1/1 Running, 0 restarts
+  - PVC uptime-kuma-data: Bound (1Gi)
+  - Service uptime-kuma: ClusterIP 10.43.90.236:3001
+  - Ingress uptime-kuma-ingress: activo, apuntando a status.homelab.local
+
+
+────────────────────────────────────────────────────────────────────────────────
+  B2 — Configurar Ingress para Uptime Kuma
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Exponer Uptime Kuma al exterior bajo el dominio status.homelab.local:8080.
+
+QUÉ SE HIZO
+  1. Ingress "uptime-kuma-ingress" en namespace homelab.
+     Regla: Host "status.homelab.local" → Service "uptime-kuma" puerto 3001.
+  2. Añadir "status.homelab.local" a /etc/hosts del host:
+       echo "127.0.0.1 status.homelab.local" | sudo tee -a /etc/hosts
+
+FICHEROS CREADOS
+  - manifests/uptime-kuma/ingress.yaml  → Ingress con regla de host
+
+VERIFICACIÓN REALIZADA
+  - Ingress activo: curl http://status.homelab.local:8080 → HTTP 302 (redirect a /dashboard)
+  - status.homelab.local añadido a /etc/hosts del host
+  - Cuenta admin creada en la UI (usuario: iker)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  B3 — Configurar monitores en Uptime Kuma
+────────────────────────────────────────────────────────────────────────────────
+
+OBJETIVO
+  Añadir un monitor por cada servicio del clúster, usando HTTP donde existe
+  un health endpoint dedicado y TCP donde el protocolo no es HTTP o existe
+  validación restrictiva del Host header.
+
+QUÉ SE HIZO
+  Los 8 monitores se añadieron via la librería Python "uptime-kuma-api" (v1.2.1)
+  que encapsula el protocolo Socket.IO de Uptime Kuma, con port-forward temporal
+  al Service ClusterIP del pod.
+
+  Todos usan DNS interno de K8s (<servicio>.<namespace>.svc.cluster.local) en
+  lugar de las URLs públicas por dos motivos:
+    a) Desde dentro del clúster las IPs de host (127.0.0.1:8080) no son
+       accesibles — los puertos de k3d son del host, no de la red de pods.
+    b) El DNS interno es más fiable y directo: no pasa por Traefik, lo que
+       significa que un fallo de Traefik no oculta un fallo del servicio real.
+
+MONITORES CREADOS
+
+  HTTP (verifican que la app procesa peticiones reales):
+  ┌─────────────────────────┬──────────────────────────────────────────────────────────────────────────────┐
+  │ Nombre                  │ URL                                                                          │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Web principal (nginx)   │ http://nginx.homelab.svc.cluster.local/health                                │
+  │ Grafana                 │ http://kube-prometheus-stack-grafana.monitoring.svc.cluster.local/api/health │
+  │ Prometheus              │ http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/-/healthy │
+  │ ArgoCD                  │ http://argocd-server.argocd.svc.cluster.local/healthz                        │
+  └─────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+
+  TCP Port (verifican que el proceso escucha en el puerto):
+  ┌─────────────────────────┬──────────────────────────────────────────────┬──────┐
+  │ Nombre                  │ Host                                         │ Puerto│
+  ├─────────────────────────┼──────────────────────────────────────────────┼──────┤
+  │ FreeScout (helpdesk)    │ freescout.homelab.svc.cluster.local          │  80  │
+  │ MariaDB                 │ mariadb.homelab.svc.cluster.local            │ 3306 │
+  │ Traefik                 │ traefik.traefik.svc.cluster.local            │   80  │
+  └─────────────────────────┴──────────────────────────────────────────────┴──────┘
+
+POR QUÉ FREESCOUT USA TCP Y NO HTTP
+  FreeScout es Laravel. Laravel valida el header Host de cada petición contra
+  APP_URL. Uptime Kuma enviaría Host: freescout.homelab.svc.cluster.local,
+  que no coincide con SITE_URL=http://helpdesk.homelab.local:8080, provocando
+  un 403. El mismo problema que resolvimos con las K8s probes en A2 (tcpSocket).
+  Si se añadiera un endpoint /healthz sin validación de host en FreeScout,
+  se podría usar HTTP. Por ahora TCP es suficiente.
+
+CONCEPTOS ASUMIDOS
+  uptime-kuma-api (Python):
+    - Uptime Kuma no expone una REST API convencional. Toda la gestión
+      (login, monitores, alertas) ocurre via Socket.IO sobre WebSocket.
+    - La librería uptime-kuma-api encapsula ese protocolo y permite
+      scripting declarativo equivalente a la UI.
+    - Patrón habitual: port-forward temporal → script → disconnect.
+      El port-forward no necesita estar activo en producción, solo durante
+      la configuración o automatizaciones puntuales.
+
+  DNS interno de K8s para monitores:
+    - <nombre-servicio>.<namespace>.svc.cluster.local es el FQDN completo.
+    - Dentro del mismo namespace se puede usar solo el nombre corto
+      (ej. "mariadb"), pero el FQDN es más explícito y funciona desde
+      cualquier namespace sin ambigüedad.
+    - CoreDNS resuelve estos nombres automáticamente para todos los pods
+      del clúster.
+
+VERIFICACIÓN REALIZADA
+  - 7 monitores activos (ArgoCD Redis eliminado por decisión de diseño)
+  - UI accesible en http://status.homelab.local:8080

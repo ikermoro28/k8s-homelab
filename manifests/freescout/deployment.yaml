@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: freescout
+  namespace: homelab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: freescout
+  template:
+    metadata:
+      labels:
+        app: freescout
+    spec:
+      containers:
+        - name: freescout
+          image: tiredofit/freescout:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: freescout-db-secret
+                  key: db-host
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: freescout-db-secret
+                  key: db-name
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: freescout-db-secret
+                  key: db-user
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: freescout-db-secret
+                  key: db-pass
+            - name: SITE_URL
+              value: "http://helpdesk.homelab.local:8080"
+            - name: ADMIN_EMAIL
+              value: "admin@homelab.local"
+            - name: ADMIN_PASS
+              value: "Admin1234!"
+            - name: ADMIN_FIRST_NAME
+              value: "Admin"
+            - name: ADMIN_LAST_NAME
+              value: "Homelab"
+            - name: SETUP_TYPE
+              value: "AUTO"
+            - name: ENABLE_AUTO_UPDATE
+              value: "FALSE"
+          volumeMounts:
+            - name: freescout-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: freescout-data
+          persistentVolumeClaim:
+            claimName: freescout-data
